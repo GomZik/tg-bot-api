@@ -17,8 +17,6 @@ import (
 	"github.com/gomzik/tg-bot-api/tg/user"
 
 	"github.com/gomzik/tg-bot-api/tg/file"
-
-	"github.com/sirupsen/logrus"
 )
 
 var (
@@ -34,9 +32,7 @@ func init() {
 }
 
 type Logger interface {
-	Debugf(format string, args ...interface{})
-	Errorf(format string, args ...interface{})
-	Infof(format string, args ...interface{})
+	Printf(...interface{})
 }
 
 type API struct {
@@ -60,18 +56,22 @@ func WithLogger(logger Logger) Option {
 	}
 }
 
+type NoOpLogger struct{}
+
+func (NoOpLogger) Printf(...interface{}) {}
+
 func New(token string, options ...Option) (*API, error) {
 	api := API{
 		token:      token,
 		httpClient: http.DefaultClient,
-		logger:     logrus.StandardLogger(),
+		logger:     NoOpLogger{},
 	}
 
 	for _, opt := range options {
 		opt(&api)
 	}
 
-	botData, err := api.GetMe()
+	botData, err := api.GetMe(context.Background())
 	if err != nil {
 		return nil, err
 	}
@@ -81,9 +81,10 @@ func New(token string, options ...Option) (*API, error) {
 
 type BotUser struct {
 	user.User
-	CanJoinGroups           bool `json:"can_join_groups"`
-	CanReadAllGroupMessages bool `json:"can_read_all_group_messages"`
-	SupportsInlineQueries   bool `json:"supports_inline_queries"`
+	Username                string `json:"username"`
+	CanJoinGroups           bool   `json:"can_join_groups"`
+	CanReadAllGroupMessages bool   `json:"can_read_all_group_messages"`
+	SupportsInlineQueries   bool   `json:"supports_inline_queries"`
 }
 
 type tgFile struct {
@@ -112,7 +113,7 @@ func (api *API) newFileRequest(ctx context.Context, filePath string) (*http.Requ
 	u.Path = path.Join("file", fmt.Sprintf("bot%s", api.token), u.Path)
 	u = tgBaseURL.ResolveReference(u)
 
-	api.logger.Debugf("tg: GET -> %s", strings.ReplaceAll(u.String(), api.token, "*****"))
+	api.logger.Printf("tg: GET -> %s", strings.ReplaceAll(u.String(), api.token, "*****"))
 
 	req, err := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
 	return req, err
@@ -129,7 +130,7 @@ func (api *API) newRequest(ctx context.Context, method, relURL string, body inte
 			return nil, err
 		}
 		bodyReader = &buf
-		api.logger.Debugf("tg: body is %s", buf.String())
+		api.logger.Printf("tg: body is %s", buf.String())
 		headers.Set("Content-Type", "application/json")
 	}
 
@@ -141,14 +142,14 @@ func (api *API) newRequest(ctx context.Context, method, relURL string, body inte
 	u.Path = path.Join(fmt.Sprintf("bot%s", api.token), u.Path)
 	u = tgBaseURL.ResolveReference(u)
 
-	api.logger.Debugf("tg: %s -> %s", method, strings.ReplaceAll(u.String(), api.token, "*****"))
+	api.logger.Printf("tg: %s -> %s", method, strings.ReplaceAll(u.String(), api.token, "*****"))
 
 	req, err := http.NewRequestWithContext(ctx, method, u.String(), bodyReader)
 	if err != nil {
 		return nil, err
 	}
 	req.Header = headers
-	api.logger.Debugf("tg: headers: %+v", headers)
+	api.logger.Printf("tg: headers: %+v", headers)
 	return req, nil
 }
 
@@ -168,7 +169,7 @@ func (api *API) do(r *http.Request, dst interface{}) error {
 	rdr := io.TeeReader(resp.Body, &debugBuf)
 	defer func() {
 		if debugBuf.Len() > 0 {
-			api.logger.Debugf("tg response: %s", debugBuf.String())
+			api.logger.Printf("tg response: %s", debugBuf.String())
 		}
 	}()
 
@@ -197,8 +198,8 @@ func (api *API) do(r *http.Request, dst interface{}) error {
 	return nil
 }
 
-func (api *API) GetMe() (*BotUser, error) {
-	req, err := api.newRequest(context.Background(), "GET", "getMe", nil)
+func (api *API) GetMe(ctx context.Context) (*BotUser, error) {
+	req, err := api.newRequest(ctx, "GET", "getMe", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -211,7 +212,7 @@ func (api *API) GetMe() (*BotUser, error) {
 }
 
 func (api *API) Username() string {
-	return *api.botData.Username
+	return api.botData.Username
 }
 
 type Update struct {
@@ -227,7 +228,7 @@ type CallbackQuery struct {
 	Data    string           `json:"data"`
 }
 
-func (api *API) GetUpdatesContext(ctx context.Context, offset int) ([]*Update, error) {
+func (api *API) GetUpdatesContext(ctx context.Context, offset int) ([]Update, error) {
 	prms := make(url.Values)
 	prms.Add("timeout", "600")
 	if offset != 0 {
@@ -242,7 +243,7 @@ func (api *API) GetUpdatesContext(ctx context.Context, offset int) ([]*Update, e
 		return nil, err
 	}
 
-	var res []*Update
+	var res []Update
 	if err := api.do(req, &res); err != nil {
 		return nil, err
 	}
@@ -250,40 +251,37 @@ func (api *API) GetUpdatesContext(ctx context.Context, offset int) ([]*Update, e
 	return res, nil
 }
 
-func (api *API) GetUpdatesChan(ctx context.Context, offset int) (<-chan Update, error) {
-	result := make(chan Update)
-
-	go func() {
-		defer close(result)
-		for {
-			upds, err := api.GetUpdatesContext(ctx, offset)
-			if err != nil {
-				api.logger.Errorf("tg: %s", err.Error())
-				return
-			}
-
-			for _, upd := range upds {
-				offset = upd.ID
-				result <- *upd
-			}
-			if len(upds) > 0 {
-				offset++
-			}
-
-			select {
-			case <-ctx.Done():
-				api.logger.Infof("tg: stop updates worker: %s", ctx.Err().Error())
-				return
-			default:
-				continue
-			}
-		}
-	}()
-
-	return result, nil
+type Handler interface {
+	HandleUpdate(context.Context, Update) error
 }
 
-func (api *API) SendMessage(msg *message.Message) (*message.Message, error) {
+type HandlerFunc func(context.Context, Update) error
+
+func (h HandlerFunc) HandleUpdate(ctx context.Context, upd Update) error {
+	return h(ctx, upd)
+}
+
+func (api *API) Pull(h Handler) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	offset := 0
+
+	for {
+		upds, err := api.GetUpdatesContext(ctx, offset)
+		if err != nil {
+			return err
+		}
+		for _, upd := range upds {
+			if err := h.HandleUpdate(ctx, upd); err != nil {
+				return err
+			}
+			offset = upd.ID + 1
+		}
+	}
+}
+
+func (api *API) SendMessage(ctx context.Context, msg *message.Message) (*message.Message, error) {
 	req := struct {
 		ChatID           int64           `json:"chat_id"`
 		Text             string          `json:"text"`
@@ -314,7 +312,7 @@ func (api *API) SendMessage(msg *message.Message) (*message.Message, error) {
 		req.ReplyMarkup = d
 	}
 
-	r, err := api.newRequest(context.Background(), "POST", "sendMessage", &req)
+	r, err := api.newRequest(ctx, "POST", "sendMessage", &req)
 	if err != nil {
 		return nil, err
 	}
@@ -326,14 +324,14 @@ func (api *API) SendMessage(msg *message.Message) (*message.Message, error) {
 	return &resp, nil
 }
 
-func (api *API) GetFile(fileID string) (*file.File, error) {
+func (api *API) GetFile(ctx context.Context, fileID string) (*file.File, error) {
 	req := struct {
 		FileID string `json:"file_id"`
 	}{
 		FileID: fileID,
 	}
 
-	r, err := api.newRequest(context.Background(), "POST", "getFile", &req)
+	r, err := api.newRequest(ctx, "POST", "getFile", &req)
 	if err != nil {
 		return nil, err
 	}
@@ -345,8 +343,8 @@ func (api *API) GetFile(fileID string) (*file.File, error) {
 	return &resp, nil
 }
 
-func (api *API) GetFD(fileID string) (io.ReadCloser, error) {
-	f, err := api.GetFile(fileID)
+func (api *API) GetFD(ctx context.Context, fileID string) (io.ReadCloser, error) {
+	f, err := api.GetFile(ctx, fileID)
 	if err != nil {
 		return nil, err
 	}
@@ -355,7 +353,7 @@ func (api *API) GetFD(fileID string) (io.ReadCloser, error) {
 		return nil, fmt.Errorf("tg: telegram servers does not return file_path")
 	}
 
-	req, err := api.newFileRequest(context.Background(), *f.FilePath)
+	req, err := api.newFileRequest(ctx, *f.FilePath)
 	if err != nil {
 		return nil, err
 	}
@@ -367,7 +365,7 @@ func (api *API) GetFD(fileID string) (io.ReadCloser, error) {
 	return &tgFile{resp}, nil
 }
 
-func (api *API) UpdateMessage(messageID int, newMsg *message.Message) (*message.Message, error) {
+func (api *API) UpdateMessage(ctx context.Context, messageID int, newMsg *message.Message) (*message.Message, error) {
 	body := struct {
 		ChatID      int64           `json:"chat_id"`
 		MessageID   int             `json:"message_id"`
@@ -392,7 +390,7 @@ func (api *API) UpdateMessage(messageID int, newMsg *message.Message) (*message.
 		body.ReplyMarkup = kb
 	}
 
-	req, err := api.newRequest(context.TODO(), "POST", "editMessageText", &body)
+	req, err := api.newRequest(ctx, "POST", "editMessageText", &body)
 	if err != nil {
 		return nil, err
 	}

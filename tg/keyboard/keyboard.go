@@ -2,40 +2,83 @@ package keyboard
 
 import "encoding/json"
 
-type KeyboardButton struct {
-	Text string `json:"text"`
+type ReplyKeyboardButton struct {
+	Text            string `json:"text"`
+	RequestContact  bool   `json:"request_contact"`
+	RequestLocation bool   `json:"request_location"`
 }
 
 type ReplyKeyboard struct {
-	Keyboard        [][]KeyboardButton `json:"keyboard"`
-	ResizeKeyboard  bool               `json:"resize_keyboard"`
-	OneTimeKeyboard bool               `json:"one_time_keyboard"`
-	Selective       bool               `json:"selective"`
+	Keyboard        [][]ReplyKeyboardButton `json:"keyboard"`
+	ResizeKeyboard  bool                    `json:"resize_keyboard"`
+	OneTimeKeyboard bool                    `json:"one_time_keyboard"`
+	Selective       bool                    `json:"selective"`
 }
 
-type ButtonRow []KeyboardButton
+type ReplyKeyboardButtonOption func(*ReplyKeyboardButton)
 
-func Button(text string) KeyboardButton {
-	return KeyboardButton{
+func RequestContact() ReplyKeyboardButtonOption {
+	return func(b *ReplyKeyboardButton) {
+		b.RequestContact = true
+	}
+}
+
+func RequestLocation() ReplyKeyboardButtonOption {
+	return func(b *ReplyKeyboardButton) {
+		b.RequestLocation = true
+	}
+}
+
+func ReplyButton(text string, opts ...ReplyKeyboardButtonOption) ReplyKeyboardButton {
+	b := ReplyKeyboardButton{
 		Text: text,
 	}
-}
 
-func Row(buttons ...KeyboardButton) ButtonRow {
-	return ButtonRow(buttons)
-}
-
-func NewReplyKeyboard(rows ...ButtonRow) *ReplyKeyboard {
-	rowsToSend := make([][]KeyboardButton, 0, len(rows))
-	for _, row := range rows {
-		rowsToSend = append(rowsToSend, []KeyboardButton(row))
+	for _, opt := range opts {
+		opt(&b)
 	}
-	return &ReplyKeyboard{
-		Keyboard:       rowsToSend,
-		ResizeKeyboard: true,
+	return b
+}
+
+type ReplyKeyboardOption func(*ReplyKeyboard)
+
+func ResizeKeyboard() ReplyKeyboardOption {
+	return func(kb *ReplyKeyboard) {
+		kb.ResizeKeyboard = true
 	}
 }
 
-func (kb *ReplyKeyboard) Serialize() ([]byte, error) {
+func OneTimeKeyboard() ReplyKeyboardOption {
+	return func(kb *ReplyKeyboard) {
+		kb.OneTimeKeyboard = true
+	}
+}
+
+func Selective() ReplyKeyboardOption {
+	return func(kb *ReplyKeyboard) {
+		kb.Selective = true
+	}
+}
+
+func NewReplyKeyboard(opts ...ReplyKeyboardOption) ReplyKeyboard {
+	kb := ReplyKeyboard{}
+	for _, opt := range opts {
+		opt(&kb)
+	}
+
+	return kb
+}
+
+func (kb *ReplyKeyboard) Row(buttons ...ReplyKeyboardButton) {
+	kb.Keyboard = append(kb.Keyboard, buttons)
+}
+
+func (kb *ReplyKeyboard) Add(buttons ...ReplyKeyboardButton) {
+	for _, btn := range buttons {
+		kb.Row(btn)
+	}
+}
+
+func (kb ReplyKeyboard) Serialize() ([]byte, error) {
 	return json.Marshal(kb)
 }
