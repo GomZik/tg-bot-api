@@ -32,7 +32,7 @@ func init() {
 }
 
 type Logger interface {
-	Printf(...interface{})
+	Printf(string, ...interface{})
 }
 
 type API struct {
@@ -59,7 +59,7 @@ func WithLogger(logger Logger) Option {
 
 type NoOpLogger struct{}
 
-func (NoOpLogger) Printf(...interface{}) {}
+func (NoOpLogger) Printf(string, ...interface{}) {}
 
 func New(token string, options ...Option) (*API, error) {
 	api := API{
