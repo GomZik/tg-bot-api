@@ -40,6 +40,7 @@ type API struct {
 	httpClient *http.Client
 	logger     Logger
 	botData    BotUser
+	handler    Handler
 }
 
 type Option func(*API)
@@ -261,7 +262,14 @@ func (h HandlerFunc) HandleUpdate(ctx context.Context, upd Update) error {
 	return h(ctx, upd)
 }
 
-func (api *API) Pull(h Handler) error {
+func (api *API) SetHandler(h Handler) {
+	api.handler = h
+}
+
+func (api *API) Poll() error {
+	if api.handler == nil {
+		return fmt.Errorf("handler not set")
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -273,7 +281,7 @@ func (api *API) Pull(h Handler) error {
 			return err
 		}
 		for _, upd := range upds {
-			if err := h.HandleUpdate(ctx, upd); err != nil {
+			if err := api.handler.HandleUpdate(ctx, upd); err != nil {
 				return err
 			}
 			offset = upd.ID + 1
@@ -400,4 +408,84 @@ func (api *API) UpdateMessage(ctx context.Context, messageID int, newMsg *messag
 		return nil, err
 	}
 	return &res, nil
+}
+
+func (api *API) RemoveWebhook(ctx context.Context) error {
+	req, err := api.newRequest(ctx, "POST", "deleteWebhook", nil)
+	if err != nil {
+		return err
+	}
+
+	if err := api.do(req, nil); err != nil {
+		return err
+	}
+	return nil
+}
+
+type WebhookParams struct {
+	maxConnections int
+	allowedUpdates []string
+}
+
+type WebhookOption func(*WebhookParams)
+
+func MaxConnections(i int) WebhookOption {
+	if i > 100 {
+		i = 100
+	}
+
+	if i < 1 {
+		i = 1
+	}
+
+	return func(p *WebhookParams) {
+		p.maxConnections = i
+	}
+}
+
+func AllowedUpadte(s string) WebhookOption {
+	return func(p *WebhookParams) {
+		p.allowedUpdates = append(p.allowedUpdates, s)
+	}
+}
+
+func (api *API) SetWebhook(ctx context.Context, url string, options ...WebhookOption) error {
+	var params WebhookParams
+	for _, opt := range options {
+		opt(&params)
+	}
+
+	reqData := struct {
+		URL            string   `json:"url"`
+		MaxConnections int      `json:"max_connections,omitempty"`
+		AllowedUpdates []string `json:"allowed_updates,omitempty"`
+	}{
+		URL:            url,
+		MaxConnections: params.maxConnections,
+		AllowedUpdates: params.allowedUpdates,
+	}
+	req, err := api.newRequest(ctx, "POST", "setWebhook", reqData)
+	if err != nil {
+		return err
+	}
+
+	if err := api.do(req, nil); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// FeedRequest used to pass webhook request
+func (api *API) FeedRequest(r *http.Request) error {
+	if api.handler == nil {
+		return fmt.Errorf("no handler set")
+	}
+
+	var upd Update
+	if err := json.NewDecoder(r.Body).Decode(&upd); err != nil {
+		return fmt.Errorf("failed to decode update: %w", err)
+	}
+
+	return api.handler.HandleUpdate(r.Context(), upd)
 }
