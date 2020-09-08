@@ -8,6 +8,12 @@ import (
 	"github.com/gomzik/tg-bot-api/tg/user"
 )
 
+type Entity struct {
+	Offset int    `json:"offset"`
+	Length int    `json:"length"`
+	Type   string `json:"type"`
+}
+
 type Message struct {
 	ID             int               `json:"message_id,omitempty"`
 	From           *user.User        `json:"from,omitempty"`
@@ -21,6 +27,7 @@ type Message struct {
 	Video          *file.Video       `json:"video,omitempty"`
 	ReplyMarkup    Keyboard          `json:"-"`
 	Markdown       bool              `json:"-"`
+	Entities       []Entity          `json:"entities,omitempty"`
 }
 
 type Keyboard interface {
