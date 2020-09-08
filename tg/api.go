@@ -23,6 +23,14 @@ var (
 	tgBaseURL *url.URL
 )
 
+type TelegramError struct {
+	StatusCode int
+}
+
+func (t TelegramError) Error() string {
+	return fmt.Sprintf("telegram returned non 200 ok status code: %d", t.StatusCode)
+}
+
 func init() {
 	u, err := url.Parse("https://api.telegram.org")
 	if err != nil {
@@ -180,7 +188,9 @@ func (api *API) do(r *http.Request, dst interface{}) error {
 	}()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("tg: failed to request telegram api: returned not 200 OK")
+		return TelegramError{
+			StatusCode: resp.StatusCode,
+		}
 	}
 
 	if dst != nil {
