@@ -432,14 +432,14 @@ func (api *API) RemoveWebhook(ctx context.Context) error {
 	return nil
 }
 
-type WebhookParams struct {
+type SetWebhookParams struct {
 	maxConnections int
 	allowedUpdates []string
 }
 
-type WebhookOption func(*WebhookParams)
+type SetWebhookOption func(*SetWebhookParams)
 
-func MaxConnections(i int) WebhookOption {
+func MaxConnections(i int) SetWebhookOption {
 	if i > 100 {
 		i = 100
 	}
@@ -448,19 +448,19 @@ func MaxConnections(i int) WebhookOption {
 		i = 1
 	}
 
-	return func(p *WebhookParams) {
+	return func(p *SetWebhookParams) {
 		p.maxConnections = i
 	}
 }
 
-func AllowedUpadte(s string) WebhookOption {
-	return func(p *WebhookParams) {
+func AllowedUpadte(s string) SetWebhookOption {
+	return func(p *SetWebhookParams) {
 		p.allowedUpdates = append(p.allowedUpdates, s)
 	}
 }
 
-func (api *API) SetWebhook(ctx context.Context, url string, options ...WebhookOption) error {
-	var params WebhookParams
+func (api *API) SetWebhook(ctx context.Context, url string, options ...SetWebhookOption) error {
+	var params SetWebhookParams
 	for _, opt := range options {
 		opt(&params)
 	}
