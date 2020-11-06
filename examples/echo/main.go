@@ -24,13 +24,7 @@ func main() {
 		panic(err)
 	}
 
-	api.SetHandler(&Bot{api})
-
-	if err := api.RemoveWebhook(context.Background()); err != nil {
-		panic(err)
-	}
-
-	if err := api.Poll(); err != nil {
+	if err := api.Run(&Bot{api}, tg.PollStrategy()); err != nil {
 		panic(err)
 	}
 }

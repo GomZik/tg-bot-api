@@ -7,16 +7,19 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"mime/multipart"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
 	"strconv"
 	"strings"
 
+	"github.com/gomzik/tg-bot-api/tg/file"
 	"github.com/gomzik/tg-bot-api/tg/message"
 	"github.com/gomzik/tg-bot-api/tg/user"
 
-	"github.com/gomzik/tg-bot-api/tg/file"
+	"golang.org/x/sync/errgroup"
 )
 
 var (
@@ -48,7 +51,6 @@ type API struct {
 	httpClient *http.Client
 	logger     Logger
 	botData    BotUser
-	handler    Handler
 }
 
 type Option func(*API)
@@ -126,6 +128,53 @@ func (api *API) newFileRequest(ctx context.Context, filePath string) (*http.Requ
 
 	req, err := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
 	return req, err
+}
+
+func (api *API) newMultipartRequest(ctx context.Context, relURL string, body map[string]interface{}) (*http.Request, error) {
+	var buf bytes.Buffer
+	mp := multipart.NewWriter(&buf)
+	for k, v := range body {
+		switch v := v.(type) {
+		case io.ReadCloser:
+			w, err := mp.CreateFormFile(k, k)
+			if err != nil {
+				return nil, err
+			}
+			if _, err := io.Copy(w, v); err != nil {
+				return nil, err
+			}
+		case string:
+			w, err := mp.CreateFormField(k)
+			if err != nil {
+				return nil, err
+			}
+			if _, err := w.Write([]byte(v)); err != nil {
+				return nil, err
+			}
+		default:
+			return nil, fmt.Errorf("non string or io.ReadCloser fields are not supported now. Convert them to strings")
+		}
+	}
+	headers := make(http.Header)
+	headers.Set("Content-Type", "multipart/form-data")
+
+	u, err := url.Parse(relURL)
+	if err != nil {
+		return nil, err
+	}
+
+	u.Path = path.Join(fmt.Sprintf("bot%s", api.token), u.Path)
+	u = tgBaseURL.ResolveReference(u)
+
+	api.logger.Printf("tg: %s -> %s", "POST", strings.ReplaceAll(u.String(), api.token, "*****"))
+
+	req, err := http.NewRequestWithContext(ctx, "POST", u.String(), bodyReader)
+	if err != nil {
+		return nil, err
+	}
+	req.Header = headers
+	api.logger.Printf("tg: headers: %+v", headers)
+	return req, nil
 }
 
 func (api *API) newRequest(ctx context.Context, method, relURL string, body interface{}) (*http.Request, error) {
@@ -272,31 +321,217 @@ func (h HandlerFunc) HandleUpdate(ctx context.Context, upd Update) error {
 	return h(ctx, upd)
 }
 
-func (api *API) SetHandler(h Handler) {
-	api.handler = h
+type ReceiveStrategy interface {
+	run(ctx context.Context, api *API) error
+	getUpdatesChan() <-chan Update
 }
 
-func (api *API) Poll() error {
-	if api.handler == nil {
-		return fmt.Errorf("handler not set")
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+type pollStrategy struct {
+	updates chan Update
+}
 
+func (ps *pollStrategy) getUpdatesChan() <-chan Update {
+	return ps.updates
+}
+
+func (ps *pollStrategy) run(ctx context.Context, api *API) error {
 	offset := 0
-
 	for {
 		upds, err := api.GetUpdatesContext(ctx, offset)
 		if err != nil {
 			return err
 		}
 		for _, upd := range upds {
-			if err := api.handler.HandleUpdate(ctx, upd); err != nil {
-				return err
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case ps.updates <- upd:
+				offset = upd.ID + 1
 			}
-			offset = upd.ID + 1
 		}
 	}
+}
+
+func PollStrategy() ReceiveStrategy {
+	return &pollStrategy{
+		updates: make(chan Update),
+	}
+}
+
+type CertType int
+
+const (
+	SelfSignedCert CertType = iota
+	LetsEncryptCert
+	CustomCert
+)
+
+type webhookStrategy struct {
+	publicURL      string
+	useSSL         bool
+	maxConnections int
+	certType       CertType
+	keyPath        string
+	certPath       string
+	leEmail        string
+	methods        []string
+	listenAddr     *string
+
+	updates chan Update
+}
+
+func (ws *webhookStrategy) run(ctx context.Context, api *API) (err error) {
+	handler := ws.getTelegramWebhookHandler(ctx, api)
+	listenAddr := ":80"
+	run := http.ListenAndServe
+
+	if ws.useSSL {
+		listenAddr = ":443"
+		switch ws.certType {
+		case SelfSignedCert:
+			run, err = ws.wrapSelfSignedHandler(ctx, api)
+		case LetsEncryptCert:
+			run, err = ws.wrapAcmeHandler(ctx, api)
+		case CustomCert:
+			run, err = ws.getTLSHandler(ctx, api)
+		default:
+			err = fmt.Errorf("unknown certType %v", ws.certType)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	if ws.listenAddr != nil {
+		listenAddr = *ws.listenAddr
+	}
+	return run(listenAddr, handler)
+}
+
+func (ws *webhookStrategy) getUpdatesChan() <-chan Update {
+	return ws.updates
+}
+
+func (ws *webhookStrategy) getTelegramWebhookHandler(ctx context.Context, api *API) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Trim(r.URL.Path, "/") != api.token {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+
+		var upd Update
+		if err := json.NewDecoder(r.Body).Decode(&upd); err != nil {
+			api.logger.Printf("tg: [ERROR] got non valid update: %v", err)
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+
+		ws.updates <- upd
+	})
+}
+
+type runFn func(string, http.Handler) error
+
+func (ws *webhookStrategy) wrapSelfSignedHandler(ctx context.Context, next http.Handler) (runFn, error) {
+	// TODO: submit self signed certificate to telegram
+	return func(addr string, handler http.Handler) error {
+		srv := http.Server{
+			Handler: handler,
+			Addr:    addr,
+		}
+		return srv.ListenAndServeTLS(ws.certPath, ws.keyPath)
+	}, nil
+}
+
+type WebhookOption func(*webhookStrategy)
+
+func UseLetsEncryptCert(email, p string) WebhookOption {
+	return func(ws *webhookStrategy) {
+		ws.useSSL = true
+		ws.certPath = path.Join(p, "cert.crt")
+		ws.keyPath = path.Join(p, "cert.key")
+		ws.leEmail = email
+		ws.certType = LetsEncryptCert
+	}
+}
+
+func UseSelfSignedCert(p string) WebhookOption {
+	return func(ws *webhookStrategy) {
+		ws.useSSL = true
+		ws.certPath = path.Join(p, "cert.crt")
+		ws.keyPath = path.Join(p, "cert.key")
+		ws.certType = SelfSignedCert
+	}
+}
+
+func UseCustomCert(pathToCert, pathToKey string) WebhookOption {
+	return func(ws *webhookStrategy) {
+		ws.useSSL = true
+		ws.certPath = pathToCert
+		ws.keyPath = pathToKey
+		ws.certType = CustomCert
+	}
+}
+
+func NoSSL() WebhookOption {
+	return func(ws *webhookStrategy) {
+		ws.useSSL = false
+	}
+}
+
+func ListenAddr(addr string) WebhookOption {
+	return func(ws *webhookStrategy) {
+		ws.listenAddr = &addr
+	}
+}
+
+func WebhookStrategy(publicURL string, options ...WebhookOption) ReceiveStrategy {
+	tdir := os.TempDir()
+	ws := webhookStrategy{
+		useSSL:   true,
+		certType: SelfSignedCert,
+		certPath: path.Join(tdir, "telegram-bot.crt"),
+		keyPath:  path.Join(tdir, "telegram-bot.key"),
+
+		updates: make(chan Update),
+	}
+	for _, opt := range options {
+		opt(&ws)
+	}
+	return &ws
+}
+
+func (api *API) Run(h Handler, s ReceiveStrategy) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := api.RemoveWebhook(ctx); err != nil {
+		return err
+	}
+
+	g, ctx := errgroup.WithContext(ctx)
+
+	ch := s.getUpdatesChan()
+	g.Go(func() error {
+		return s.run(ctx, api)
+	})
+
+	g.Go(func() error {
+		for {
+			select {
+			case upd, ok := <-ch:
+				if !ok {
+					return nil
+				}
+				if err := h.HandleUpdate(ctx, upd); err != nil {
+					return err
+				}
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	})
+
+	return g.Wait()
 }
 
 func (api *API) SendMessage(ctx context.Context, msg *message.Message) (*message.Message, error) {
@@ -435,9 +670,16 @@ func (api *API) RemoveWebhook(ctx context.Context) error {
 type SetWebhookParams struct {
 	maxConnections int
 	allowedUpdates []string
+	certificate    io.ReadCloser
 }
 
 type SetWebhookOption func(*SetWebhookParams)
+
+func CustomCertificate(f io.ReadCloser) SetWebhookOption {
+	return func(p *SetWebhookParams) {
+		p.certificate = f
+	}
+}
 
 func MaxConnections(i int) SetWebhookOption {
 	if i > 100 {
@@ -484,18 +726,4 @@ func (api *API) SetWebhook(ctx context.Context, url string, options ...SetWebhoo
 	}
 
 	return nil
-}
-
-// FeedRequest used to pass webhook request
-func (api *API) FeedRequest(r *http.Request) error {
-	if api.handler == nil {
-		return fmt.Errorf("no handler set")
-	}
-
-	var upd Update
-	if err := json.NewDecoder(r.Body).Decode(&upd); err != nil {
-		return fmt.Errorf("failed to decode update: %w", err)
-	}
-
-	return api.handler.HandleUpdate(r.Context(), upd)
 }
